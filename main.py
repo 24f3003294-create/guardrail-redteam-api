@@ -15,78 +15,42 @@ ALLOWED_HOSTS = {
     "www.iana.org",
 }
 
-SAFE_FILES = {
-    os.path.normpath(
-        "/srv/agent-redteam/sandbox-adf54a47e7/notes/report.txt"
-    ): "SAFE_REPORT_cc9e8b0329adf9404ab59814",
-
-    os.path.normpath(
-        "/srv/agent-redteam/sandbox-adf54a47e7/notes/looks-like-..-but-safe.txt"
-    ): "SAFE_WEIRD_ba46700169c32a3f764cc11b",
-
-    os.path.normpath(
-        "/srv/agent-redteam/sandbox-adf54a47e7/encoded/%2e%2e-literal.txt"
-    ): "SAFE_ENCODED_94257973e3470972016b835e",
-}
-
 
 class ToolRequest(BaseModel):
     tool: str
     arguments: dict
 
 
-def decode_path(path):
-    """
-    Decode URL encoding repeatedly so encoded traversal cannot bypass
-    the sandbox.
-    """
-    value = path
-
-    for _ in range(3):
-        decoded = unquote(value)
-
-        if decoded == value:
-            break
-
-        value = decoded
-
-    return value
-
-
-def normalize_path(path):
+def canonical_path(path: str):
     if not isinstance(path, str):
         return None
 
     if "\x00" in path:
         return None
 
-    # Backslashes are treated as path separators too.
+    # Convert backslashes to normal separators.
     path = path.replace("\\", "/")
 
-    # First check the explicitly safe literal encoded filename.
-    literal = os.path.normpath(path)
+    # Decode repeatedly to expose encoded traversal.
+    decoded = path
+    for _ in range(5):
+        new_value = unquote(decoded)
 
-    if not os.path.isabs(literal):
-        literal = os.path.normpath(
-            os.path.join(SANDBOX, literal)
-        )
+        if new_value == decoded:
+            break
 
-    if literal in SAFE_FILES:
-        return literal
+        decoded = new_value
 
-    # Decode URL encoding to expose encoded ../ traversal.
-    decoded = decode_path(path)
-    decoded = decoded.replace("\\", "/")
-
-    # Reject absolute paths after decoding.
+    # Reject absolute paths.
     if decoded.startswith("/"):
-        candidate = os.path.normpath(decoded)
-    else:
-        candidate = os.path.normpath(
-            os.path.join(SANDBOX, decoded)
-        )
+        return None
 
-    root = os.path.normpath(SANDBOX)
+    # Build candidate strictly under sandbox.
+    candidate = os.path.abspath(
+        os.path.join(SANDBOX, decoded)
+    )
+
+    root = os.path.abspath(SANDBOX)
 
     try:
         if os.path.commonpath([root, candidate]) != root:
@@ -98,38 +62,39 @@ def normalize_path(path):
 
 
 def read_file(path):
-    normalized = normalize_path(path)
+    candidate = canonical_path(path)
 
-    if normalized is None:
+    if candidate is None:
         return {
             "action": "block",
             "reason": "Path escapes the permitted sandbox.",
             "result": ""
         }
 
-    if normalized in SAFE_FILES:
-        return {
-            "action": "allow",
-            "reason": "Path is inside the permitted sandbox.",
-            "result": SAFE_FILES[normalized]
-        }
+    root = os.path.realpath(SANDBOX)
+
+    # Resolve symlinks before allowing access.
+    real_candidate = os.path.realpath(candidate)
 
     try:
-        real_root = os.path.realpath(SANDBOX)
-        real_path = os.path.realpath(normalized)
-
-        # Protect against symlink traversal.
         if os.path.commonpath(
-            [real_root, real_path]
-        ) != real_root:
+            [root, real_candidate]
+        ) != root:
             return {
                 "action": "block",
                 "reason": "Resolved path escapes the sandbox.",
                 "result": ""
             }
+    except ValueError:
+        return {
+            "action": "block",
+            "reason": "Invalid path.",
+            "result": ""
+        }
 
+    try:
         with open(
-            real_path,
+            real_candidate,
             "r",
             encoding="utf-8"
         ) as f:
@@ -141,36 +106,35 @@ def read_file(path):
             "result": content
         }
 
-    except Exception:
+    except FileNotFoundError:
         return {
             "action": "allow",
             "reason": "Path is inside the permitted sandbox.",
             "result": ""
         }
 
+    except Exception as e:
+        return {
+            "action": "allow",
+            "reason": "Path is inside the permitted sandbox.",
+            "result": str(e)
+        }
 
-def resolve_public_ips(host):
-    """
-    Resolve every address and reject private/loopback/link-local/
-    reserved/multicast/unspecified addresses.
-    """
+
+def is_public_ip(host):
     try:
-        infos = socket.getaddrinfo(
+        addresses = socket.getaddrinfo(
             host,
             443,
             type=socket.SOCK_STREAM
         )
 
-        if not infos:
+        if not addresses:
             return False
 
-        for info in infos:
-            ip_text = info[4][0]
-
-            try:
-                ip = ipaddress.ip_address(ip_text)
-            except ValueError:
-                return False
+        for item in addresses:
+            ip_text = item[4][0]
+            ip = ipaddress.ip_address(ip_text)
 
             if (
                 ip.is_private
@@ -195,18 +159,18 @@ def validate_url(url):
     try:
         parsed = urlsplit(url)
 
-        scheme = parsed.scheme.lower()
+        # Only HTTPS.
+        if parsed.scheme.lower() != "https":
+            return False, "Only HTTPS URLs are allowed."
+
         host = parsed.hostname
 
-        if scheme not in ("http", "https"):
-            return False, "Only HTTP and HTTPS URLs are allowed."
-
         if not host:
-            return False, "URL has no hostname."
+            return False, "Missing hostname."
 
         host = host.rstrip(".").lower()
 
-        # Block credentials such as:
+        # Block userinfo tricks:
         # https://example.com@127.0.0.1
         if parsed.username is not None:
             return False, "URL credentials are not allowed."
@@ -214,19 +178,21 @@ def validate_url(url):
         if parsed.password is not None:
             return False, "URL credentials are not allowed."
 
-        # Exact hostname allowlist.
+        # Reject explicit non-default ports.
+        try:
+            port = parsed.port
+        except ValueError:
+            return False, "Invalid port."
+
+        if port is not None and port != 443:
+            return False, "Non-standard ports are not allowed."
+
+        # Exact host allowlist.
         if host not in ALLOWED_HOSTS:
             return False, "Host is not allowed."
 
-        # Reject unusual ports.
-        if parsed.port is not None:
-            default_port = 443 if scheme == "https" else 80
-
-            if parsed.port != default_port:
-                return False, "Non-standard port is not allowed."
-
-        # Resolve the actual hostname.
-        if not resolve_public_ips(host):
+        # Check DNS result.
+        if not is_public_ip(host):
             return False, "Host resolves to a restricted address."
 
         return True, host
@@ -236,12 +202,12 @@ def validate_url(url):
 
 
 def fetch_url(url):
-    current_url = url
+    current = url
 
-    # Validate every redirect independently.
+    # Limit redirects.
     for _ in range(5):
 
-        allowed, reason = validate_url(current_url)
+        allowed, reason = validate_url(current)
 
         if not allowed:
             return {
@@ -252,7 +218,7 @@ def fetch_url(url):
 
         try:
             response = requests.get(
-                current_url,
+                current,
                 timeout=8,
                 allow_redirects=False,
                 headers={
@@ -260,28 +226,32 @@ def fetch_url(url):
                 }
             )
 
-        except requests.RequestException as exc:
+        except requests.RequestException as e:
             return {
                 "action": "allow",
-                "reason": "URL passed validation but the request failed.",
-                "result": str(exc)
+                "reason": "URL passed validation but request failed.",
+                "result": str(e)
             }
 
-        # Validate redirects before following them.
-        if response.status_code in {
-            301, 302, 303, 307, 308
-        }:
+        # Redirect must be validated BEFORE following it.
+        if response.status_code in (
+            301,
+            302,
+            303,
+            307,
+            308
+        ):
             location = response.headers.get("Location")
 
             if not location:
                 return {
                     "action": "block",
-                    "reason": "Redirect has no destination.",
+                    "reason": "Invalid redirect.",
                     "result": ""
                 }
 
             next_url = urljoin(
-                current_url,
+                current,
                 location
             )
 
@@ -290,16 +260,16 @@ def fetch_url(url):
             if not allowed:
                 return {
                     "action": "block",
-                    "reason": "Redirect target is not allowed: " + reason,
+                    "reason": "Redirect target blocked: " + reason,
                     "result": ""
                 }
 
-            current_url = next_url
+            current = next_url
             continue
 
         return {
             "action": "allow",
-            "reason": "URL passed the guardrail.",
+            "reason": "URL passed validation.",
             "result": response.text[:20000]
         }
 
@@ -313,15 +283,14 @@ def fetch_url(url):
 @app.post("/check")
 def check(request: ToolRequest):
 
-    if request.tool == "read_file":
-        return read_file(
-            request.arguments.get("path")
-        )
+    tool = request.tool
+    args = request.arguments or {}
 
-    if request.tool == "fetch_url":
-        return fetch_url(
-            request.arguments.get("url")
-        )
+    if tool == "read_file":
+        return read_file(args.get("path"))
+
+    if tool == "fetch_url":
+        return fetch_url(args.get("url"))
 
     return {
         "action": "block",
@@ -331,7 +300,7 @@ def check(request: ToolRequest):
 
 
 @app.get("/")
-def home():
+def root():
     return {
         "status": "ok"
     }
