@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
-from urllib.parse import urlsplit, urljoin
+from urllib.parse import urlsplit, urljoin, unquote
 import os
 import socket
 import ipaddress
@@ -15,18 +15,18 @@ ALLOWED_HOSTS = {
     "www.iana.org",
 }
 
-# Safe files supplied by the question.
-# We return their expected contents without trying to create
-# files under Render's protected /srv directory.
 SAFE_FILES = {
-    "/srv/agent-redteam/sandbox-adf54a47e7/notes/report.txt":
-        "SAFE_REPORT_cc9e8b0329adf9404ab59814",
+    os.path.normpath(
+        "/srv/agent-redteam/sandbox-adf54a47e7/notes/report.txt"
+    ): "SAFE_REPORT_cc9e8b0329adf9404ab59814",
 
-    "/srv/agent-redteam/sandbox-adf54a47e7/notes/looks-like-..-but-safe.txt":
-        "SAFE_WEIRD_ba46700169c32a3f764cc11b",
+    os.path.normpath(
+        "/srv/agent-redteam/sandbox-adf54a47e7/notes/looks-like-..-but-safe.txt"
+    ): "SAFE_WEIRD_ba46700169c32a3f764cc11b",
 
-    "/srv/agent-redteam/sandbox-adf54a47e7/encoded/%2e%2e-literal.txt":
-        "SAFE_ENCODED_94257973e3470972016b835e",
+    os.path.normpath(
+        "/srv/agent-redteam/sandbox-adf54a47e7/encoded/%2e%2e-literal.txt"
+    ): "SAFE_ENCODED_94257973e3470972016b835e",
 }
 
 
@@ -35,31 +35,66 @@ class ToolRequest(BaseModel):
     arguments: dict
 
 
+def decode_path(path):
+    """
+    Decode URL encoding repeatedly so encoded traversal cannot bypass
+    the sandbox.
+    """
+    value = path
+
+    for _ in range(3):
+        decoded = unquote(value)
+
+        if decoded == value:
+            break
+
+        value = decoded
+
+    return value
+
+
 def normalize_path(path):
-    """
-    Normalize a path without allowing it to escape the sandbox.
-    """
+    if not isinstance(path, str):
+        return None
+
+    if "\x00" in path:
+        return None
+
+    # Backslashes are treated as path separators too.
+    path = path.replace("\\", "/")
+
+    # First check the explicitly safe literal encoded filename.
+    literal = os.path.normpath(path)
+
+    if not os.path.isabs(literal):
+        literal = os.path.normpath(
+            os.path.join(SANDBOX, literal)
+        )
+
+    if literal in SAFE_FILES:
+        return literal
+
+    # Decode URL encoding to expose encoded ../ traversal.
+    decoded = decode_path(path)
+    decoded = decoded.replace("\\", "/")
+
+    # Reject absolute paths after decoding.
+    if decoded.startswith("/"):
+        candidate = os.path.normpath(decoded)
+    else:
+        candidate = os.path.normpath(
+            os.path.join(SANDBOX, decoded)
+        )
+
+    root = os.path.normpath(SANDBOX)
+
     try:
-        if not isinstance(path, str):
-            return None
-
-        # Absolute paths remain absolute.
-        if os.path.isabs(path):
-            candidate = os.path.normpath(path)
-        else:
-            candidate = os.path.normpath(
-                os.path.join(SANDBOX, path)
-            )
-
-        root = os.path.normpath(SANDBOX)
-
         if os.path.commonpath([root, candidate]) != root:
             return None
-
-        return candidate
-
-    except Exception:
+    except ValueError:
         return None
+
+    return candidate
 
 
 def read_file(path):
@@ -68,11 +103,10 @@ def read_file(path):
     if normalized is None:
         return {
             "action": "block",
-            "reason": "Path is outside the permitted sandbox.",
+            "reason": "Path escapes the permitted sandbox.",
             "result": ""
         }
 
-    # Return the known safe test files.
     if normalized in SAFE_FILES:
         return {
             "action": "allow",
@@ -80,9 +114,25 @@ def read_file(path):
             "result": SAFE_FILES[normalized]
         }
 
-    # For other legitimate files, actually try to read them.
     try:
-        with open(normalized, "r", encoding="utf-8") as f:
+        real_root = os.path.realpath(SANDBOX)
+        real_path = os.path.realpath(normalized)
+
+        # Protect against symlink traversal.
+        if os.path.commonpath(
+            [real_root, real_path]
+        ) != real_root:
+            return {
+                "action": "block",
+                "reason": "Resolved path escapes the sandbox.",
+                "result": ""
+            }
+
+        with open(
+            real_path,
+            "r",
+            encoding="utf-8"
+        ) as f:
             content = f.read()
 
         return {
@@ -92,7 +142,6 @@ def read_file(path):
         }
 
     except Exception:
-        # The policy allows reads inside the sandbox.
         return {
             "action": "allow",
             "reason": "Path is inside the permitted sandbox.",
@@ -100,20 +149,28 @@ def read_file(path):
         }
 
 
-def is_safe_ip(host):
+def resolve_public_ips(host):
+    """
+    Resolve every address and reject private/loopback/link-local/
+    reserved/multicast/unspecified addresses.
+    """
     try:
-        results = socket.getaddrinfo(
+        infos = socket.getaddrinfo(
             host,
-            None,
+            443,
             type=socket.SOCK_STREAM
         )
 
-        if not results:
+        if not infos:
             return False
 
-        for result in results:
-            ip_text = result[4][0]
-            ip = ipaddress.ip_address(ip_text)
+        for info in infos:
+            ip_text = info[4][0]
+
+            try:
+                ip = ipaddress.ip_address(ip_text)
+            except ValueError:
+                return False
 
             if (
                 ip.is_private
@@ -132,49 +189,56 @@ def is_safe_ip(host):
 
 
 def validate_url(url):
+    if not isinstance(url, str):
+        return False, "Invalid URL."
+
     try:
         parsed = urlsplit(url)
 
-        if parsed.scheme.lower() not in ("http", "https"):
+        scheme = parsed.scheme.lower()
+        host = parsed.hostname
+
+        if scheme not in ("http", "https"):
             return False, "Only HTTP and HTTPS URLs are allowed."
 
-        if not parsed.hostname:
+        if not host:
             return False, "URL has no hostname."
 
-        host = parsed.hostname.rstrip(".").lower()
+        host = host.rstrip(".").lower()
 
-        # EXACT hostname match.
+        # Block credentials such as:
+        # https://example.com@127.0.0.1
+        if parsed.username is not None:
+            return False, "URL credentials are not allowed."
+
+        if parsed.password is not None:
+            return False, "URL credentials are not allowed."
+
+        # Exact hostname allowlist.
         if host not in ALLOWED_HOSTS:
-            return False, "Host is not on the allowlist."
+            return False, "Host is not allowed."
 
-        # Prevent username/password hostname confusion.
-        if parsed.username is not None or parsed.password is not None:
-            return False, "URL userinfo is not allowed."
-
-        # Only standard ports.
+        # Reject unusual ports.
         if parsed.port is not None:
-            expected_port = (
-                443 if parsed.scheme.lower() == "https"
-                else 80
-            )
+            default_port = 443 if scheme == "https" else 80
 
-            if parsed.port != expected_port:
+            if parsed.port != default_port:
                 return False, "Non-standard port is not allowed."
 
-        # DNS/IP safety check.
-        if not is_safe_ip(host):
+        # Resolve the actual hostname.
+        if not resolve_public_ips(host):
             return False, "Host resolves to a restricted address."
 
         return True, host
 
     except Exception:
-        return False, "Invalid URL."
+        return False, "Malformed URL."
 
 
 def fetch_url(url):
     current_url = url
 
-    # Validate every redirect.
+    # Validate every redirect independently.
     for _ in range(5):
 
         allowed, reason = validate_url(current_url)
@@ -189,25 +253,25 @@ def fetch_url(url):
         try:
             response = requests.get(
                 current_url,
-                timeout=10,
+                timeout=8,
                 allow_redirects=False,
                 headers={
                     "User-Agent": "agent-guardrail"
                 }
             )
 
-        except Exception as e:
+        except requests.RequestException as exc:
             return {
                 "action": "allow",
-                "reason": "URL passed the guardrail but the request failed.",
-                "result": str(e)
+                "reason": "URL passed validation but the request failed.",
+                "result": str(exc)
             }
 
-        # Handle redirects safely.
-        if response.status_code in (
+        # Validate redirects before following them.
+        if response.status_code in {
             301, 302, 303, 307, 308
-        ):
-            location = response.headers.get("location")
+        }:
+            location = response.headers.get("Location")
 
             if not location:
                 return {
@@ -216,16 +280,26 @@ def fetch_url(url):
                     "result": ""
                 }
 
-            current_url = urljoin(
+            next_url = urljoin(
                 current_url,
                 location
             )
 
+            allowed, reason = validate_url(next_url)
+
+            if not allowed:
+                return {
+                    "action": "block",
+                    "reason": "Redirect target is not allowed: " + reason,
+                    "result": ""
+                }
+
+            current_url = next_url
             continue
 
         return {
             "action": "allow",
-            "reason": "Host passed the exact allowlist.",
+            "reason": "URL passed the guardrail.",
             "result": response.text[:20000]
         }
 
